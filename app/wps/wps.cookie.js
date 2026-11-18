@@ -1,7 +1,8 @@
 /**
- * WPS · Cookie 抓取
+ * WPS · Cookie 抓取(多账号)
  *
- * 抓取:打开「WPS」APP → 进任意活动页(任务中心/福利中心,如「天天领福利」)→ 自动触发 page_info,抓 wps_sid
+ * 抓取:打开「WPS」APP → 进任意活动页(任务中心/福利中心,如「天天领福利」)→ 自动触发 page_info
+ * 存入 wps_sids_list:[{uid, wps_sid, ts}, ...],按 uid 更新
  *
  * @Author: MaYIHEI <https://github.com/MaYIHEI/paperclip>
  * @Channel: Telegram 频道 https://t.me/mayihei
@@ -10,8 +11,7 @@
 
 const $ = new Env("WPS [Cookie]");
 
-const CK_KEY = "wps_sid"; // 只存 wps_sid 这一个长效登录态(activity 接口认 wps_sids,值与 wps_sid 相同)
-const LIST_KEY = "wps_sids_list"; // 多账号:[{uid, wps_sid, ts}, ...],按 uid 更新
+const LIST_KEY = "wps_sids_list"; // [{uid, wps_sid, ts}, ...],按 uid 更新
 
 (function main() {
     if (typeof $request === "undefined") {
@@ -38,39 +38,26 @@ const LIST_KEY = "wps_sids_list"; // 多账号:[{uid, wps_sid, ts}, ...],按 uid
         const sid = exact ? exact[1] : m[1];
         if (exact && exact[1] !== m[1]) $.log("[WARN] wps_sids? 命中值与 wps_sid 不同,已按 wps_sid 写入");
 
-        // 多账号:cookie 里的 uid 是用户编号(唯一),按 uid 写入/更新列表;没有 uid 时仍走单账号兼容写入
         const muid = cookie.match(/(?:^|;\s*)uid=([^;]+)/);
         const uid = muid ? String(muid[1]).trim() : "";
-        if (uid) {
-            const list = (safeJson($.getdata(LIST_KEY) || "[]") || []).filter((x) => x && x.uid && x.wps_sid);
-            const hit = list.find((x) => String(x.uid) === uid);
-            if (hit) {
-                hit.wps_sid = sid;
-                hit.ts = Date.now();
-            } else {
-                list.push({ uid, wps_sid: sid, ts: Date.now() });
-            }
-            $.setdata(JSON.stringify(list), LIST_KEY);
-            $.setdata("", list.length <= 1 ? "wps_status" : `wps_status_${uid}`);
-            $.log(`[INFO] ${hit ? "已更新" : "已新增"} 账号 uid=${uid} wps_sid=${maskSid(sid)},共 ${list.length} 个`);
-            $.msg("WPS", "✅ WPS Cookie 获取成功", `uid=${uid},共 ${list.length} 个账号`);
-        } else {
-            $.log("[WARN] cookie 里没有 uid,仅写入单账号 wps_sid(多账号需带 uid 的请求)");
-        }
-
-        // 单账号兼容:面板手填 / 青龙环境变量仍读这个键
-        const old = $.getdata(CK_KEY) || "";
-        if (!uid && old === sid) {
-            $.log("[INFO] wps_sid 未变,跳过更新");
+        if (!uid) {
+            $.log("[WARN] cookie 里没有 uid,跳过(多账号必须以 uid 为唯一键)");
             $.done();
             return;
         }
-        $.setdata(sid, CK_KEY);
-        if (!uid) {
-            $.setdata("", "wps_status"); // 新 Cookie 待签到验证,先撤掉旧的体检结果
-            $.log(`[INFO] 已更新 wps_sid (${maskSid(sid)})`);
-            $.msg("WPS", "✅ WPS Cookie 获取成功", "可去签到脚本验证");
+
+        const list = (safeJson($.getdata(LIST_KEY) || "[]") || []).filter((x) => x && x.uid && x.wps_sid);
+        const hit = list.find((x) => String(x.uid) === uid);
+        if (hit) {
+            hit.wps_sid = sid;
+            hit.ts = Date.now();
+        } else {
+            list.push({ uid, wps_sid: sid, ts: Date.now() });
         }
+        $.setdata(JSON.stringify(list), LIST_KEY);
+        $.setdata("", `wps_status_${uid}`); // 新 Cookie 待签到验证,先撤掉该账号旧体检结果
+        $.log(`[INFO] ${hit ? "已更新" : "已新增"} 账号 uid=${uid} wps_sid=${maskSid(sid)},共 ${list.length} 个`);
+        $.msg("WPS", "✅ WPS Cookie 获取成功", `uid=${uid},共 ${list.length} 个账号`);
     } catch (e) {
         $.log("[ERROR] cookie 抓取失败: " + e);
     }

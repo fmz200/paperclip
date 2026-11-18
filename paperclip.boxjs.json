@@ -948,7 +948,6 @@
       "id": "paperclip.wps",
       "name": "WPS",
       "keys": [
-        "wps_sid",
         "wps_sids_list",
         "wps_clear",
         "wps_task_hot",
@@ -961,27 +960,21 @@
       ],
       "settings": [
         {
-          "id": "wps_sid",
-          "name": "Cookie(wps_sid)",
-          "val": "",
-          "type": "text",
-          "placeholder": "进活动页自动抓，或手填",
-          "desc": "WPS 登录态 wps_sid(长效，抓一次长期用);留空靠抓取自动写入"
-        },
-        {
           "id": "wps_sids_list",
-          "name": "多账号 Cookie",
+          "name": "账号列表(wps_sids_list)",
           "val": "",
-          "type": "text",
+          "type": "textarea",
+          "autoGrow": true,
+          "rows": 4,
           "placeholder": "[{\"uid\":\"1197685883\",\"wps_sid\":\"...\",\"ts\":0}]",
-          "desc": "多账号存这里(JSON 数组,uid 为唯一键)。切换账号重进一次活动页即按 uid 更新/累加,无需手填"
+          "desc": "唯一账号源(JSON 数组,uid 为唯一键)。切换账号重进一次活动页即按 uid 更新/累加;也可手填"
         },
         {
           "id": "wps_clear",
-          "name": "清除 Cookie",
+          "name": "清除账号列表",
           "val": false,
           "type": "boolean",
-          "desc": "开启后运行一次会清空已抓的 wps_sid 与多账号列表并自动复位为关闭;之后重新抓取"
+          "desc": "开启后运行一次会清空 wps_sids_list 并自动复位为关闭;之后重新抓取"
         },
         {
           "id": "wps_task_hot",

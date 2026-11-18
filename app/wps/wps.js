@@ -2,11 +2,11 @@
  * WPS · 每日签到 + 福利中心(打卡/抽奖/会员试用申请/限量爆款领取)+ 小程序每日打卡,送积分与会员时长
  *
  * 抓取:打开「WPS」APP → 进任意活动页(任务中心/福利中心)→ 自动触发 page_info,抓 wps_sid
- * 签到:cron 10 点触发,抢完限量爆款顺手做签到等其余任务,逐个串行、动作间随机间隔(细节见 README)
+ * 签到:cron 10 点触发;多账号并行(allSettled),账号内任务串行+随机间隔(细节见 README)
  *
  * @Author: MaYIHEI <https://github.com/MaYIHEI/paperclip>
  * @Channel: Telegram 频道 https://t.me/mayihei
- * @Updated: 2026-10-28
+ * @Updated: 2026-11-18
  *
  * ===== Loon =====
  * [MITM]
@@ -56,11 +56,11 @@ const $ = new Env("WPS");
 $.merge = typeof $argument === "object" && !!$argument && $argument.merge === true;
 if ($.merge) $.msg = (...a) => console.log(a.filter((x) => typeof x === "string" && x).join("\n"));
 
-const SCRIPT_VERSION = "2026-11-18.r6"; // 改一次 +1,确认拉到最新版
+const SCRIPT_VERSION = "2026-11-18.r7"; // 改一次 +1,确认拉到最新版
 $.log(`[INFO] 脚本版本 ${SCRIPT_VERSION}`);
 
-const CK_KEY = "wps_sid";         // 兼容:单账号 / 面板手填 / 青龙环境变量
-const LIST_KEY = "wps_sids_list"; // 多账号:[{uid, wps_sid, ts}, ...],按 uid 去重
+const LIST_KEY = "wps_sids_list"; // 唯一账号源:[{uid, wps_sid, ts}, ...],按 uid 去重
+const ACCOUNT_TIMEOUT = 240000;   // 单账号最长 4 分钟,超时不拖死其它并行账号
 
 // 任务开关:关闭才跳过(兼容字符串 "false"/"0" 与布尔 false,不同 BoxJS 存法都认);未设置=默认开启
 function taskOff(k) {
@@ -74,36 +74,36 @@ function debug(content) {
     $.log(`[DEBUG] ${typeof content === "string" ? content : JSON.stringify(content)}`);
 }
 
-// 多账号时每个账号写各自的体检 key;单账号仍用原 wps_status
-let STA = { key: "wps_status", name: "WPS" };
-
 // 记录本次结果,供「签到汇总」:ok 正常 / cookie 需重新抓取 / fail 其他失败 / none 未使用
-function saveStatus(s, msg) {
+// sta = { key, name },由各账号上下文传入,并行时互不覆盖
+function saveStatus(sta, s, msg) {
     msg = String(msg).slice(0, 100);
-    // 服务器明确提示登录过期的失败,按需要重新抓取处理
     if (s === "fail" && /过期|重新登录|未登录|请登录|登录失效|登录已失效|token\s*(失效|过期|无效)|not\s*login/i.test(msg)) s = "cookie";
-    // 同一天已有带奖励的成功记录时,再次运行得到的「今日已签」不覆盖它的奖励文字,只合并本次的资产等信息
     let keep = null;
     if (s === "ok" && /^今日已/.test(msg)) {
         const day = (t) => new Date(t + 8 * 3600 * 1000).toISOString().slice(0, 10);
         let old = null;
-        try { old = JSON.parse($.getdata(STA.key) || "null"); } catch (e) {}
+        try { old = JSON.parse($.getdata(sta.key) || "null"); } catch (e) {}
         if (old && old.s === "ok" && !/^今日已/.test(old.msg) && day(old.t) === day(Date.now())) keep = old;
     }
-    checkinReport(STA.key, keep ? keepReward(keep, { s, msg }) : { s, msg }, { name: STA.name, author: "MaYIHEI", open: "https://apps.apple.com/app/id599852710" });
+    checkinReport(sta.key, keep ? keepReward(keep, { s, msg }) : { s, msg }, { name: sta.name, author: "MaYIHEI", open: "https://apps.apple.com/app/id599852710" });
 }
 
-// 读账号列表:以 uid 为唯一键;手填的 wps_sid 没有 uid 时仍可单跑
+// 只读 LIST_KEY,条目必须同时有 uid + wps_sid
 function loadAccounts() {
-    const list = (safeJson($.getdata(LIST_KEY) || "[]") || []).filter((x) => x && x.wps_sid && x.uid);
-    const manual = String($.getdata(CK_KEY) || "").trim();
-    if (manual && !list.some((x) => x.wps_sid === manual)) list.push({ uid: "", wps_sid: manual });
-    return list;
+    return (safeJson($.getdata(LIST_KEY) || "[]") || []).filter((x) => x && x.wps_sid && x.uid);
 }
 
 function maskSid(s) {
     s = String(s || "");
     return s.length < 12 ? "已获取" : s.slice(0, 6) + "***" + s.slice(-4);
+}
+
+function withTimeout(promise, ms, label) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} 超时(${Math.round(ms / 1000)}s)`)), ms)),
+    ]);
 }
 
 // ===== 接口 =====
@@ -145,19 +145,16 @@ const MINI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWeb
 // 动作间隔(秒,[最小,最大] 每步独立取随机,各不相等):10 点抢完顺手把其余做了,模拟真人手动操作避风控
 const ACTION_GAP = [5, 10];
 
-$.results = []; // 各任务结果汇总,最后一条通知
 
-// 清除 cookie 开关(BoxJS 写 wps_clear=true)
+// 清除 cookie 开关(BoxJS 写 wps_clear=true):只清多账号列表
 if (JSON.parse($.getdata("wps_clear") || "false")) {
-    $.setdata("", CK_KEY);
     $.setdata("", LIST_KEY);
     $.setdata("false", "wps_clear");
-    $.msg("WPS", "", "✅ Cookie 已清除，请重新抓取");
+    $.msg("WPS", "", "✅ 账号列表已清除，请重新抓取");
     $.done();
 } else {
     main().catch((e) => {
         $.log(`[ERROR] 主流程异常: ${e}`);
-        saveStatus("fail", String(e));
         $.msg("WPS", "❌ 运行异常", String(e));
     }).finally(() => $.done());
 }
@@ -165,115 +162,111 @@ if (JSON.parse($.getdata("wps_clear") || "false")) {
 async function main() {
     const accounts = loadAccounts();
     if (!accounts.length) {
-        saveStatus("none", "未抓取 Cookie");
-        $.msg("WPS", "🚫 缺少 Cookie", "请先开启 cookie 抓取脚本,打开 WPS APP 进任意活动页停留 1 秒");
+        $.msg("WPS", "🚫 缺少账号", "请先开启 cookie 抓取,打开 WPS 进活动页(需带 uid),写入 wps_sids_list");
         return;
     }
 
-    // 逐个账号:写回 wps_sid 后复用原 runAccount(httpReq 等仍现读 wps_sid,任务逻辑不动)
     const total = accounts.length;
-    const blocks = [];
-    for (let i = 0; i < total; i++) {
-        const acc = accounts[i];
-        STA = {
-            key: total > 1 ? `wps_status_${acc.uid || acc.wps_sid.slice(0, 8)}` : "wps_status",
-            name: total > 1 ? `WPS${i + 1}` : "WPS",
-        };
-        $.setdata(acc.wps_sid, CK_KEY);
-        $.results.length = 0;
-        $.log(`[INFO] ===== 账号 ${i + 1}/${total} (uid=${acc.uid || "?"}, ${maskSid(acc.wps_sid)}) =====`);
-        try {
-            await runAccount();
-        } catch (e) {
-            $.log(`[ERROR] 账号 ${i + 1} 异常: ${e}`);
-            $.results.push(`❌ 异常: ${e}`);
-            saveStatus("fail", String(e));
-        }
-        blocks.push([total > 1 ? `👤 账号 ${i + 1}${acc.uid ? `(uid=${acc.uid})` : ""}` : "", ...$.results.slice()].filter(Boolean).join("\n"));
-        if (i < total - 1) await sleep(jitter([8000, 20000]));
-    }
+    const slots = accounts.map((acc, i) => ({
+        idx: i + 1,
+        ctx: {
+            sid: acc.wps_sid,
+            uid: String(acc.uid),
+            results: [],
+            sta: { key: `wps_status_${acc.uid}`, name: total > 1 ? `WPS${i + 1}` : "WPS" },
+        },
+    }));
 
-    $.msg("WPS 任务汇总", "", blocks.join("\n\n"));
+    // 多账号并行:某一账号报错/超时不影响其它账号;全部结束后发一条汇总通知
+    $.log(`[INFO] 并行执行 ${total} 个账号(单账号超时 ${ACCOUNT_TIMEOUT / 1000}s)`);
+    await Promise.allSettled(slots.map((s) =>
+        withTimeout(runAccount(s.ctx), ACCOUNT_TIMEOUT, `账号${s.idx}/uid=${s.ctx.uid}`)
+            .catch((e) => {
+                $.log(`[ERROR] 账号 ${s.idx} (uid=${s.ctx.uid}): ${e}`);
+                s.ctx.results.push(`❌ 异常: ${e}`);
+                saveStatus(s.ctx.sta, "fail", String(e));
+            })
+    ));
+
+    const blocks = slots.map((s) =>
+        [`👤 账号 ${s.idx}(uid=${s.ctx.uid})`, ...s.ctx.results].filter(Boolean).join("\n")
+    );
+    $.msg("WPS 任务汇总", `${total} 个账号`, blocks.join("\n\n"));
 }
 
-// 原单账号主流程(登录校验 + 任务串行),多账号时对每个账号各跑一遍
-async function runAccount() {
-    // 动态取 user_id(签到加密需要,不写进脚本)+ 顺带校验登录态。
+// 单账号流程(登录校验 + 任务串行);ctx 隔离 sid/results/status,可与其它账号并行
+async function runAccount(ctx) {
+    const { sid, uid: listUid, results, sta } = ctx;
+    $.log(`[INFO] ===== 账号 uid=${listUid} (${maskSid(sid)}) =====`);
+
+    // 动态取 user_id(签到加密需要)+ 顺带校验登录态。
     // 关键:区分「网络超时(reject)」与「服务端明确返回非 ok(真失效)」——
     // 整点 cron 易撞网络抖动,网络错误重试一次自愈,绝不能误报成 cookie 失效让用户白重抓。
     let uid, lastErr;
     for (let attempt = 0; attempt < 2 && !uid; attempt++) {
         if (attempt > 0) await sleep(3000);
         try {
-            const r = await httpReq("GET", ISLOGIN);
+            const r = await httpReq("GET", ISLOGIN, { sid });
             const j = JSON.parse(r.body);
             if (j.result !== "ok" || !j.userid) {
-                // 服务端明确判失效 = 真·登录态失效,不重试
-                saveStatus("cookie", "wps_sid 已过期");
-                $.results.push("🚫 登录态失效: wps_sid 已过期,请重新抓取(打开 WPS 进活动页)");
-                $.log(`[ERROR] islogin 非 ok: ${r.body.slice(0, 200)}`);
+                saveStatus(sta, "cookie", "wps_sid 已过期");
+                results.push("🚫 登录态失效: wps_sid 已过期,请重新抓取(打开 WPS 进活动页)");
+                $.log(`[ERROR] uid=${listUid} islogin 非 ok: ${r.body.slice(0, 200)}`);
                 return;
             }
             uid = j.userid;
-            $.log(`[INFO] user_id 已获取(${String(uid).slice(0, 3)}***)`);
-            saveStatus("ok", "登录态有效");
+            $.log(`[INFO] uid=${listUid} user_id 已获取(${String(uid).slice(0, 3)}***)`);
+            saveStatus(sta, "ok", "登录态有效");
         } catch (e) {
-            lastErr = e; // 网络超时 / 连接失败 / 响应非 JSON → 值得重试
-            $.log(`[WARN] islogin 网络错误(${attempt + 1}/2): ${e}`);
+            lastErr = e;
+            $.log(`[WARN] uid=${listUid} islogin 网络错误(${attempt + 1}/2): ${e}`);
         }
     }
     if (!uid) {
-        // 重试后仍失败:是网络问题,不是 Cookie 失效——别误导用户去重抓
-        saveStatus("fail", "网络异常,未能校验登录态");
-        $.results.push("⚠️ 网络异常: islogin 超时(非 Cookie 失效)");
-        $.log(`[ERROR] islogin 重试后仍失败: ${lastErr}`);
+        saveStatus(sta, "fail", "网络异常,未能校验登录态");
+        results.push("⚠️ 网络异常: islogin 超时(非 Cookie 失效)");
+        $.log(`[ERROR] uid=${listUid} islogin 重试后仍失败: ${lastErr}`);
         return;
     }
 
-    // 任务清单:每项可在 BoxJS 单独开关(默认开;关闭则整项跳过,连同它的随机间隔)。
-    // 10 点 cron 触发,逐个串行、动作间随机间隔(模拟真人,避风控)。
-    // 顺序讲究(两端时间需求相反):
-    //   ① 限量爆款放最前——库存少,10:00 窗口一开就得抢,晚了没了,绝不能让它等;
-    //   ② 小程序打卡放最后——它走 personal-bus 域,整点 10:00:00 有后端尖峰偶发
-    //      invalid connection,排最后离尖峰最远(被前面任务自然往后挪几十秒),再叠加它
-    //      自带的「开头随机错峰 + 4 次退避重试」兜底(即便单独开它也靠这两层扛尖峰)。
+    // 账号内任务仍串行+随机间隔;账号之间并行。
+    // 顺序:限量爆款最前(库存少);小程序打卡最后(避开整点尖峰)。
     const tasks = [
-        ["wps_task_hot", () => taskHot()],
-        ["wps_task_trial", () => taskTrial()],
-        ["wps_task_signin", () => taskSignIn(uid)],
-        ["wps_task_fragment", () => taskFragment()],
-        ["wps_task_lottery", () => taskLottery()],
-        ["wps_task_clockin", () => taskClockIn()],
+        ["wps_task_hot", () => taskHot(ctx)],
+        ["wps_task_trial", () => taskTrial(ctx)],
+        ["wps_task_signin", () => taskSignIn(ctx, uid)],
+        ["wps_task_fragment", () => taskFragment(ctx)],
+        ["wps_task_lottery", () => taskLottery(ctx)],
+        ["wps_task_clockin", () => taskClockIn(ctx)],
     ];
-    // 打印每个开关实际读到的原始值(排查 BoxJS 是否生效:null=未设置默认开)
-    $.log(`[INFO] 任务开关 ${tasks.map(([k]) => `${k.slice(9)}=${JSON.stringify($.getdata(k))}`).join(" ")}`);
+    $.log(`[INFO] uid=${listUid} 任务开关 ${tasks.map(([k]) => `${k.slice(9)}=${JSON.stringify($.getdata(k))}`).join(" ")}`);
 
     let ran = 0;
     for (const [key, run] of tasks) {
-        if (taskOff(key)) continue;                    // BoxJS 关闭该任务 → 跳过
-        if (ran++ > 0) await sleep(jitter(ACTION_GAP)); // 任务间随机间隔避风控
+        if (taskOff(key)) continue;
+        if (ran++ > 0) await sleep(jitter(ACTION_GAP));
         await run();
     }
-    if (!ran) $.results.push("ℹ️ 所有任务均已关闭(插件设置或 BoxJS)");
+    if (!ran) results.push("ℹ️ 所有任务均已关闭(插件设置或 BoxJS)");
 
-    saveStatus("ok", $.results.map((r) => r.replace(/^\S+\s*/, "")).join(" · ")); // 汇总里显示各任务结果
+    saveStatus(sta, "ok", results.map((r) => r.replace(/^\S+\s*/, "")).join(" · "));
 }
 
 // ============ 任务:每日签到(请求体加密)============
 
-async function taskSignIn(uid) {
+async function taskSignIn(ctx, uid) {
     const tag = "每日签到";
     try {
         // 已签则跳过
-        const di = await httpReq("GET", DAY_INFO);
+        const di = await httpReq("GET", DAY_INFO, { sid: ctx.sid });
         const info = (JSON.parse(di.body).data || {}).info || {};
         if (info.has_sign) {
-            $.results.push(`✅ ${tag}:已签到`);
+            ctx.results.push(`✅ ${tag}:已签到`);
             return;
         }
 
         // 取全局公钥
-        const ek = await httpReq("GET", ENC_KEY);
+        const ek = await httpReq("GET", ENC_KEY, { sid: ctx.sid });
         const pubKeyB64 = JSON.parse(ek.body).data;
         if (!pubKeyB64) throw new Error(`公钥获取失败: ${ek.body.slice(0, 120)}`);
 
@@ -284,25 +277,25 @@ async function taskSignIn(uid) {
         const token = rsaEncryptB64(aesKey, pubKeyB64);
 
         const body = JSON.stringify({ encrypt: true, extra, pay_origin: "ios_ucs_rwzx sign", channel: "" });
-        const r = await httpReq("POST", SIGN_IN, { body, token });
+        const r = await httpReq("POST", SIGN_IN, { body, token, sid: ctx.sid });
         const j = safeJson(r.body);
         if (j && j.result === "ok") {
             const names = ((j.data || {}).rewards || []).map((x) => x.reward_name).filter(Boolean);
-            $.results.push(`✅ ${tag}:成功${names.length ? " " + names.join("/") : ""}`);
+            ctx.results.push(`✅ ${tag}:成功${names.length ? " " + names.join("/") : ""}`);
         } else {
             const st = classify(j && (j.ext_msg || j.msg), "已签到");
-            $.results.push(`${st.e} ${tag}:${st.t}`);
+            ctx.results.push(`${st.e} ${tag}:${st.t}`);
             if (st.e !== "✅") debug(`${tag} 响应: ${r.body.slice(0, 300)}`);
         }
     } catch (e) {
-        $.results.push(`❌ ${tag}:异常`);
+        ctx.results.push(`❌ ${tag}:异常`);
         $.log(`[ERROR] ${tag}: ${e}`);
     }
 }
 
 // ============ 任务:福利中心通用组件动作(明文 base64)============
 
-async function taskComponent(tag, comp, action, payload, doneLabel) {
+async function taskComponent(ctx, tag, comp, action, payload, doneLabel) {
     try {
         const uniq = {
             activity_number: FLZX.activity_number,
@@ -315,45 +308,45 @@ async function taskComponent(tag, comp, action, payload, doneLabel) {
         for (const k in payload) reqObj[k] = payload[k];
 
         // body 与响应均为 JSON
-        const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj) });
+        const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj), sid: ctx.sid });
         const j = safeJson(r.body);
         if (!j) {
-            $.results.push(`❌ ${tag}:无响应`);
+            ctx.results.push(`❌ ${tag}:无响应`);
             debug(`${tag} 响应: ${r.body.slice(0, 300)}`);
             return;
         }
         // 外层 result 只代表请求被受理(打卡已签时这里直接报 Duplicate 错);真正成败看内层 data.<action>.success
         if (j.result !== "ok") {
             const st = classify(j.msg || j.ext_msg, doneLabel);
-            $.results.push(`${st.e} ${tag}:${st.t}`);
+            ctx.results.push(`${st.e} ${tag}:${st.t}`);
             if (st.e !== "✅") debug(`${tag} 响应: ${r.body.slice(0, 300)}`);
             return;
         }
         const inner = (j.data || {})[action.split(".")[0]] || {};
         if (inner.success === true) {
-            $.results.push(`✅ ${tag}:成功${inner.reward_name ? " " + inner.reward_name : ""}`);
+            ctx.results.push(`✅ ${tag}:成功${inner.reward_name ? " " + inner.reward_name : ""}`);
         } else {
             // 内层失败:优先看 reason,抽奖次数用完(error_code 10005)归为已达上限
             let reason = inner.reason || "";
             if (!reason && inner.error_code === 10005) reason = "次数用完";
             if (!reason) reason = j.msg || (inner.error_code ? `code ${inner.error_code}` : "");
             const st = classify(reason, doneLabel);
-            $.results.push(`${st.e} ${tag}:${st.t}`);
+            ctx.results.push(`${st.e} ${tag}:${st.t}`);
             if (st.e !== "✅") debug(`${tag} 响应: ${r.body.slice(0, 300)}`);
         }
     } catch (e) {
-        $.results.push(`❌ ${tag}:异常`);
+        ctx.results.push(`❌ ${tag}:异常`);
         $.log(`[ERROR] ${tag}: ${e}`);
     }
 }
 
 // ============ 福利中心 page_info 复用助手 ============
 // page_info 返回活动页全部组件的实时状态(各组件挂自己的业务字段),多个任务都从这里取状态。
-async function fetchPageInfo() {
+async function fetchPageInfo(ctx) {
     // 必带 filter_params 的 position,否则服务端返回的组件不含本用户态(打卡序列/选择记录读不到)
     const filter = encodeURIComponent(JSON.stringify({ cs_from: "", mk_key: "", position: FLZX_POSITION }));
     const pi = await httpReq("GET",
-        `${PAGE_INFO}?activity_number=${FLZX.activity_number}&page_number=${FLZX.page_number}&filter_params=${filter}`);
+        `${PAGE_INFO}?activity_number=${FLZX.activity_number}&page_number=${FLZX.page_number}&filter_params=${filter}`, { sid: ctx.sid });
     const pj = safeJson(pi.body);
     if (!pj || pj.result !== "ok" || !Array.isArray(pj.data)) {
         debug(`page_info 异常: ${(pi.body || "").slice(0, 300)}`);
@@ -373,19 +366,19 @@ function findComp(list, number, node) {
 //   - 选项打分:会员(privilege_type=="privilege")最高,其余按 hours/积分数排序;按分从高到低逐个尝试;
 //   - select_reach_limit==true = 今天这 1 次已用掉 → 直接 ✅;
 //   - 超级会员限 1200 份、10:00 一开几分钟就光,必须靠 hot 排首位踩整点抢。
-async function taskHot() {
+async function taskHot(ctx) {
     const tag = "限量爆款";
     const comp = COMPONENTS.hot;
     try {
-        const list = await fetchPageInfo();
-        if (!list) { $.results.push(`❌ ${tag}:page_info 无响应`); return; }
+        const list = await fetchPageInfo(ctx);
+        if (!list) { ctx.results.push(`❌ ${tag}:page_info 无响应`); return; }
         const node = findComp(list, comp.component_number, comp.component_node_id);
         const ps = (node && node.privilege_select) || {};
         const details = ps.privilege_select_details || [];
-        if (!details.length) { $.results.push(`⚠️ ${tag}:未找到爆款组件(可能已换期,需重抓)`); return; }
+        if (!details.length) { ctx.results.push(`⚠️ ${tag}:未找到爆款组件(可能已换期,需重抓)`); return; }
 
         // 今天这次机会已用掉
-        if (ps.select_reach_limit) { $.results.push(`✅ ${tag}:已领取(今日已选)`); return; }
+        if (ps.select_reach_limit) { ctx.results.push(`✅ ${tag}:已领取(今日已选)`); return; }
 
         // 按价值排序:会员优先,其次积分多的优先(hours*100 + nums,会员再加底分)
         const score = (d) => (d.privilege_type === "privilege" ? 10000 : 0) + (d.hours || 0) * 100 + (d.nums || 0);
@@ -405,20 +398,20 @@ async function taskHot() {
                 // group_id 与 privilege_id 各选项不一定相等(会员是 1/101),都取自 detail
                 privilege_select: { group_id: d.group_id, privilege_id: d.privilege_id },
             };
-            const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj) });
+            const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj), sid: ctx.sid });
             const j = safeJson(r.body);
             const inner = (j && j.data && j.data.privilege_select) || {};
             if (j && j.result === "ok" && inner.success === true) {
-                $.results.push(`✅ ${tag}:成功 ${d.title || "pid " + d.privilege_id}`);
+                ctx.results.push(`✅ ${tag}:成功 ${d.title || "pid " + d.privilege_id}`);
                 done = true;
                 break;
             }
             // 这档没抢到(多半已秒光)→ 记一笔继续抢下一档
             debug(`${tag} ${d.title}(pid ${d.privilege_id})未中: ${(r.body || "").slice(0, 200)}`);
         }
-        if (!done) $.results.push(`⚠️ ${tag}:未领到(超级会员已秒光、其余也没抢到)`);
+        if (!done) ctx.results.push(`⚠️ ${tag}:未领到(超级会员已秒光、其余也没抢到)`);
     } catch (e) {
-        $.results.push(`❌ ${tag}:异常`);
+        ctx.results.push(`❌ ${tag}:异常`);
         $.log(`[ERROR] ${tag}: ${e}`);
     }
 }
@@ -428,19 +421,19 @@ async function taskHot() {
 // 旧实现固定传 series_id:"" + is_new_sign_series:true,等于每天「新建序列」→ 永远停在第 1 天。
 // 正确逻辑(对齐官方 H5 fragment-collect 组件):有序列就复用、is_new_sign_series=false;
 // 只有从无序列(第一次)时才置 true。series_id 从 page_info 的 fragment 组件里取。
-async function taskFragment() {
+async function taskFragment(ctx) {
     const tag = "打卡领会员";
     const comp = COMPONENTS.fragment;
     try {
         const today = beijingDate();
 
         // 1) 取当前序列状态:page_info 返回各组件,fragment 组件挂 sign_series_id + sign_records
-        const list = await fetchPageInfo();
+        const list = await fetchPageInfo(ctx);
         const node = findComp(list, comp.component_number);
         // 安全闸:page_info 没拿到 fragment 组件(网络错/换期)→ 绝不盲签,否则会被当「新序列」从头开始。
         // 宁可今天不签(用户开 app 点一下即可),也不把已坚持的连续天数清零。
         if (!node) {
-            $.results.push(`⚠️ ${tag}:未取到序列状态,跳过(避免误清零连续天数)`);
+            ctx.results.push(`⚠️ ${tag}:未取到序列状态,跳过(避免误清零连续天数)`);
             debug(`${tag} page_info 未含 fragment 组件 ${comp.component_number}`);
             return;
         }
@@ -452,7 +445,7 @@ async function taskFragment() {
         // 今天已签则跳过(sign_records 里今天 sign_status==signed)
         const todayRec = records.find((r) => r && r.sign_date === today);
         if (todayRec && todayRec.sign_status === "signed") {
-            $.results.push(`✅ ${tag}:已打卡`);
+            ctx.results.push(`✅ ${tag}:已打卡`);
             return;
         }
 
@@ -469,7 +462,7 @@ async function taskFragment() {
                 component_action: "fragment_collect.sign_in",
                 fragment_collect: { sign_date: today, series_id: sid, is_new_sign_series: isNew },
             };
-            const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj) });
+            const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj), sid: ctx.sid });
             return { r, j: safeJson(r.body) };
         };
         let isNew = !seriesId;
@@ -481,26 +474,26 @@ async function taskFragment() {
             ({ r, j } = await signIn("", true));
         }
         if (!j) {
-            $.results.push(`❌ ${tag}:无响应`);
+            ctx.results.push(`❌ ${tag}:无响应`);
             debug(`${tag} 响应: ${r.body.slice(0, 300)}`);
             return;
         }
         if (j.result !== "ok") {
             const st = classify(j.msg || j.ext_msg, "已打卡");
-            $.results.push(`${st.e} ${tag}:${st.t}`);
+            ctx.results.push(`${st.e} ${tag}:${st.t}`);
             if (st.e !== "✅") debug(`${tag} 响应: ${r.body.slice(0, 300)}`);
             return;
         }
         const inner = (j.data || {}).fragment_collect || {};
         if (inner.success === true) {
-            $.results.push(`✅ ${tag}:成功${isNew ? "(新序列)" : ""}`);
+            ctx.results.push(`✅ ${tag}:成功${isNew ? "(新序列)" : ""}`);
         } else {
             const st = classify(inner.reason || j.msg, "已打卡");
-            $.results.push(`${st.e} ${tag}:${st.t}`);
+            ctx.results.push(`${st.e} ${tag}:${st.t}`);
             if (st.e !== "✅") debug(`${tag} 响应: ${r.body.slice(0, 300)}`);
         }
     } catch (e) {
-        $.results.push(`❌ ${tag}:异常`);
+        ctx.results.push(`❌ ${tag}:异常`);
         $.log(`[ERROR] ${tag}: ${e}`);
     }
 }
@@ -509,11 +502,11 @@ async function taskFragment() {
 // 免费抽奖次数(lottery_list[].times)在每天 10:00 之后才刷出来(实测 cron 10:00 那刻常是 0、
 // 10:05 才变 1)。旧实现不看次数直接 exec,撞 0 次 → 服务端回 10005,被误判成「已达上限」。
 // 改为先读 page_info 的 times:有次数才抽、没次数如实报(不再假报已达上限);session_id 动态取。
-async function taskLottery() {
+async function taskLottery(ctx) {
     const tag = "天天抽奖";
     const comp = COMPONENTS.lottery;
     try {
-        const list = await fetchPageInfo();
+        const list = await fetchPageInfo(ctx);
         const node = findComp(list, comp.component_number, comp.component_node_id);
         const lv = (node && node.lottery_v2) || {};
         const sessions = lv.lottery_list || [];
@@ -524,7 +517,7 @@ async function taskLottery() {
 
         if (times < 1) {
             // 免费次数还没刷出来(cron 跑太早)= 正常,如实报,别误判已达上限
-            $.results.push(`✅ ${tag}:今日暂无免费次数`);
+            ctx.results.push(`✅ ${tag}:今日暂无免费次数`);
             return;
         }
 
@@ -539,21 +532,21 @@ async function taskLottery() {
             component_action: "lottery_v2.exec",
             lottery_v2: { session_id: sessionId },
         };
-        const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj) });
+        const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj), sid: ctx.sid });
         const j = safeJson(r.body);
         const inner = (j && j.data && j.data.lottery_v2) || {};
         if (j && j.result === "ok" && inner.success === true) {
-            $.results.push(`✅ ${tag}:成功${inner.reward_name ? " " + inner.reward_name : ""}`);
+            ctx.results.push(`✅ ${tag}:成功${inner.reward_name ? " " + inner.reward_name : ""}`);
         } else {
             // 极少数:刚读到次数但 exec 时已被用掉 → error_code 10005 归「次数用完」
             let reason = inner.send_msg || "";
             if (!reason && inner.error_code === 10005) reason = "次数用完";
             const st = classify(reason || (j && j.msg), "已完成");
-            $.results.push(`${st.e} ${tag}:${st.t}`);
+            ctx.results.push(`${st.e} ${tag}:${st.t}`);
             if (st.e !== "✅") debug(`${tag} 响应: ${(r.body || "").slice(0, 300)}`);
         }
     } catch (e) {
-        $.results.push(`❌ ${tag}:异常`);
+        ctx.results.push(`❌ ${tag}:异常`);
         $.log(`[ERROR] ${tag}: ${e}`);
     }
 }
@@ -562,7 +555,7 @@ async function taskLottery() {
 // 先 preview 拿当天奖品(session_id/cycle_id 每期变,不硬编码),三个全部申领(均次日开奖)。
 // 逐个状态写清楚:✓=本次申领成功、已申领、已领完、没资格、已达上限等。
 
-async function taskTrial() {
+async function taskTrial(ctx) {
     const tag = "会员试用";
     try {
         const base = {
@@ -574,7 +567,7 @@ async function taskTrial() {
         const callTrial = async (action, extra) => {
             const reqObj = { component_uniq_number: base, component_type: COMPONENTS.trial.type, component_action: action };
             for (const k in extra) reqObj[k] = extra[k];
-            const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj) });
+            const r = await httpReq("POST", COMPONENT, { body: JSON.stringify(reqObj), sid: ctx.sid });
             return safeJson(r.body);
         };
         const short = (t) => String(t || "奖品").replace(/超级会员/g, ""); // 7天卡 / 月卡 / 3个月卡
@@ -584,7 +577,7 @@ async function taskTrial() {
         const details = (((pv || {}).data || {}).divide_prize || {}).divide_prize_details || [];
         // 没明细 / 三档都已申领 → 直接收成一句(正常完成,不逐项罗列)
         if (!details.length || details.every((d) => d.has_join)) {
-            $.results.push(`✅ ${tag}:全部已申请`);
+            ctx.results.push(`✅ ${tag}:全部已申请`);
             return;
         }
 
@@ -612,9 +605,9 @@ async function taskTrial() {
             }
         }
         // 三档全部到位(本次成功或之前已申请)→ 折叠成一句;有问题才逐项罗列
-        $.results.push(allGood ? `✅ ${tag}:全部已申请` : `⚠️ ${tag}:${parts.join(" ")}`);
+        ctx.results.push(allGood ? `✅ ${tag}:全部已申请` : `⚠️ ${tag}:${parts.join(" ")}`);
     } catch (e) {
-        $.results.push(`❌ ${tag}:异常`);
+        ctx.results.push(`❌ ${tag}:异常`);
         $.log(`[ERROR] ${tag}: ${e}`);
     }
 }
@@ -624,10 +617,10 @@ async function taskTrial() {
 // Signature = HMAC-SHA256( s_key + MD5(body) + Date , ss )(均现拉,无内嵌密钥):
 //   s_key 来自 clock_in/v1/info(每账号每日变);ss 来自 CONF 配置端点(活动级盐)。
 
-async function taskClockIn() {
+async function taskClockIn(ctx) {
     const tag = "小程序打卡";
     try {
-        const sid = $.getdata(CK_KEY);
+        const sid = ctx.sid;
 
         // 整点 cron 可能精确撞上 10:00:00 的后端尖峰(尤其只单独开这一项时)→ 先错峰几秒再打首个请求
         await sleep(jitter([3, 10]));
@@ -661,7 +654,7 @@ async function taskClockIn() {
             const which = !ss ? "ss" : "s_key";
             const src = !ss ? cfBody : infBody;
             const m = ((safeJson(src) || {}).msg) || src.slice(0, 60) || `缺 ${which}`;
-            $.results.push(`⚠️ ${tag}:接口异常(取 ${which} 失败:${m})`);
+            ctx.results.push(`⚠️ ${tag}:接口异常(取 ${which} 失败:${m})`);
             debug(`${tag} info: ss=${!!ss} s_key=${!!s_key} cf=${cfBody.slice(0, 120)} inf=${infBody.slice(0, 120)}`);
             return;
         }
@@ -676,17 +669,17 @@ async function taskClockIn() {
         if (j && j.result === "ok") {
             const d = j.data || {};
             const rw = d.reward_name || (d.prize && d.prize.name) || (d.reward && d.reward.name) || "";
-            $.results.push(`✅ ${tag}:成功${rw ? " " + rw : ""}`);
+            ctx.results.push(`✅ ${tag}:成功${rw ? " " + rw : ""}`);
         } else {
             const st = classify(j && j.msg, "已打卡");
-            $.results.push(`${st.e} ${tag}:${st.t}`);
+            ctx.results.push(`${st.e} ${tag}:${st.t}`);
             if (st.e !== "✅") debug(`${tag} 响应: ${r.body.slice(0, 300)}`);
         }
 
         // 领取昨日打卡奖励(奖励次日开放、隔天作废)。与打卡无关,不论今天签没签都尝试领。
-        await claimClockInRewards(infBody, sid, s_key, ss);
+        await claimClockInRewards(ctx, infBody, sid, s_key, ss);
     } catch (e) {
-        $.results.push(`❌ ${tag}:异常`);
+        ctx.results.push(`❌ ${tag}:异常`);
         $.log(`[ERROR] ${tag}: ${e}`);
     }
 }
@@ -694,7 +687,7 @@ async function taskClockIn() {
 // 领取昨日打卡奖励:reward_list 里 reward_status==1 的(1=可领取/昨日签到今日开放)逐个 POST。
 // 复用打卡同一套 Signature(s_key+MD5(body)+Date 用 ss 做 HMAC);body 带 reward_id + clock_in_time。
 // 奖励是 PDF/图片/AI 体验等 1 天权益,不领次日作废;真正发放靠这一个接口,不需要微信授权 code。
-async function claimClockInRewards(infBody, sid, s_key, ss) {
+async function claimClockInRewards(ctx, infBody, sid, s_key, ss) {
     try {
         const list = (((safeJson(infBody) || {}).data || {}).reward_list || {}).list || [];
         const pend = list.filter((rw) => rw && rw.reward_status === 1);
@@ -703,7 +696,7 @@ async function claimClockInRewards(infBody, sid, s_key, ss) {
         debug(`奖励表(${list.length}): ${list.map((rw) => `${rw.reward_id}=${rw.reward_status}`).join(" ") || "空"}`);
         if (!pend.length) {
             // 空场也报一行,避免「跑没跑、有没有可领」全靠猜;两种成因分开提示
-            $.results.push(list.length ? "ℹ️ 昨日奖励:暂无可领(未到开放时间)" : "⚠️ 领奖:未取到奖励列表");
+            ctx.results.push(list.length ? "ℹ️ 昨日奖励:暂无可领(未到开放时间)" : "⚠️ 领奖:未取到奖励列表");
             return;
         }
 
@@ -720,8 +713,8 @@ async function claimClockInRewards(infBody, sid, s_key, ss) {
             else { fail.push(name); debug(`领奖 ${name}(${rw.reward_id}) 失败: ${(r.body || "").slice(0, 200)}`); }
             await sleep(jitter(ACTION_GAP)); // 多个奖励之间留间隔
         }
-        if (got.length) $.results.push(`✅ 领昨日奖励:${got.join("、")}`);
-        if (fail.length) $.results.push(`⚠️ 待领奖励未领成功(可去小程序手动领):${fail.join("、")}`);
+        if (got.length) ctx.results.push(`✅ 领昨日奖励:${got.join("、")}`);
+        if (fail.length) ctx.results.push(`⚠️ 待领奖励未领成功(可去小程序手动领):${fail.join("、")}`);
     } catch (e) {
         $.log(`[ERROR] 领昨日奖励: ${e}`);
     }
@@ -749,8 +742,8 @@ function canonicalJSON(obj) {
 
 // ============ HTTP(携带 wps_sid;签到带 token 头)============
 
-function httpReq(method, url, { body, token } = {}) {
-    const sid = $.getdata(CK_KEY);
+function httpReq(method, url, { body, token, sid } = {}) {
+    if (!sid) throw new Error("httpReq 缺少 sid");
     const headers = {
         "User-Agent": UA,
         "Cookie": `wps_sid=${sid}; wps_sids=${sid}`,
