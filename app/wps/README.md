@@ -31,6 +31,17 @@ WPS Office 每日签到 + 福利中心多项任务,送 WPS 积分与超级会员
 
 > 青龙:在环境变量设 `wps_sid`(值为抓到的 wps_sid),直接拉 `wps.js` 跑。
 
+## 多账号
+
+支持多个 WPS 账号,签到逐个执行、**账号之间互不影响**。
+
+- **唯一键是 cookie 里的 `uid`**:列表存 `wps_sids_list`,结构为 `[{uid, wps_sid, ts}, ...]`。同 uid 重抓只更新 `wps_sid`/`ts`,新 uid 才追加。
+- **抓取方式**:每个账号在 APP 登录后进一次活动页即可自动累加;`wps_sid` 仍按原正则抓取,并额外读 `uid`。
+- **执行方式**:跑某个账号前把 `wps_sid` 写回该账号的值,后面请求照旧「现读 `wps_sid`」,任务代码不改。
+- **状态各记各的**:单账号仍写 `wps_status`;多账号写 `wps_status_<uid>`。
+- **超时**:多账号耗时长,请把 cron `timeout` 设到 **600**。
+- `wps_clear` 写 `true` 会连列表一起清空。
+
 ## BoxJS 单独开关(可自定义)
 
 在 BoxJS 订阅里 `WPS` 面板,每个任务可单独开/关(默认全开),关掉的整项跳过:
@@ -46,13 +57,14 @@ WPS Office 每日签到 + 福利中心多项任务,送 WPS 积分与超级会员
 
 > 不用 BoxJS 的(青龙等):不设这些键即全部开启;要关某项就把对应键值设为 `false`。
 
-面板还含:`wps_sid`(Cookie,可手填)、`清除 Cookie`、`调试模式`(开启打印各任务接口原始响应,排错用)。
+面板还含:`wps_sid`(Cookie,可手填)、`wps_sids_list`(多账号)、`清除 Cookie`、`调试模式`(开启打印各任务接口原始响应,排错用)。
 
 ## 执行节奏 + 反风控
 
 - **10 点触发,一口气做完**:抢完限量爆款后顺手做签到/打卡/抽奖/试用,模拟真人操作,不空等。
 - 任务**逐个串行,动作之间随机间隔几秒、各不相等**,绝不并发,尽量避开风控。
-- `wps_clear` 写 `true` 可清除已存 Cookie(下次运行生效)。
+- **cron 的 `timeout` 至少要 600**:单账号约 1 分钟,账号一多就超。
+- `wps_clear` 写 `true` 可清除已存 Cookie(下次运行生效,多账号时连列表一起清)。
 
 ## Loon
 
@@ -75,7 +87,7 @@ hostname = personal-act.wps.cn
 [Script]
 WPS Cookie = type=http-request,pattern=^https:\/\/personal-act\.wps\.cn\/activity-rubik\/activity\/page_info,requires-body=false,max-size=0,script-path=https://raw.githubusercontent.com/MaYIHEI/paperclip/refs/heads/main/app/wps/wps.cookie.js,img-url=https://raw.githubusercontent.com/MaYIHEI/pin/refs/heads/main/app/wps.png
 
-WPS签到 = type=cron,cronexp=0 10 * * *,timeout=120,script-path=https://raw.githubusercontent.com/MaYIHEI/paperclip/refs/heads/main/app/wps/wps.js,img-url=https://raw.githubusercontent.com/MaYIHEI/pin/refs/heads/main/app/wps.png
+WPS签到 = type=cron,cronexp=0 10 * * *,timeout=600,script-path=https://raw.githubusercontent.com/MaYIHEI/paperclip/refs/heads/main/app/wps/wps.js,img-url=https://raw.githubusercontent.com/MaYIHEI/pin/refs/heads/main/app/wps.png
 ```
 
 ## Quantumult X
@@ -98,7 +110,7 @@ cron:
   script:
     - name: WPS签到
       cron: '0 10 * * *'
-      timeout: 120
+      timeout: 600
 
 http:
   mitm:
@@ -128,6 +140,7 @@ script-providers:
 | 2026-06-19 | 初版:每日签到 + 福利中心打卡/抽奖/试用申请/限量爆款 |
 | 2026-06-19 | 改单条 10 点 cron,抢完爆款顺手做完其余,任务串行、动作间随机间隔避风控 |
 | 2026-06-20 | 并入小程序每日打卡(同一 wps_sid,无需额外抓取) |
+| 2026-11-18 | 多账号:按 cookie `uid` 累加 `[{uid,wps_sid,ts}]`,写回 `wps_sid` 复用原任务流程 |
 | 2026-06-20 | 修复会员试用:旧接口失效(报已完成但未申请),改 preview 拿当天奖品三档全部申领 |
 | 2026-06-20 | 通知文案统一:已签到/已打卡/已申领/已领取/已达上限/已领完/没资格,逐项状态写清 |
 | 2026-06-20 | 接入 BoxJS;每个任务支持单独开关(默认全开)+ 调试模式 |

@@ -20,7 +20,7 @@
  * hostname = personal-act.wps.cn
  * [Script]
  * WPS Cookie = type=http-request,pattern=^https:\/\/personal-act\.wps\.cn\/activity-rubik\/activity\/page_info,requires-body=false,max-size=0,script-path=https://raw.githubusercontent.com/MaYIHEI/paperclip/refs/heads/main/app/wps/wps.cookie.js,img-url=https://raw.githubusercontent.com/MaYIHEI/pin/refs/heads/main/app/wps.png
- * WPS签到 = type=cron,cronexp=0 10 * * *,timeout=120,script-path=https://raw.githubusercontent.com/MaYIHEI/paperclip/refs/heads/main/app/wps/wps.js,img-url=https://raw.githubusercontent.com/MaYIHEI/pin/refs/heads/main/app/wps.png
+ * WPS签到 = type=cron,cronexp=0 10 * * *,timeout=600,script-path=https://raw.githubusercontent.com/MaYIHEI/paperclip/refs/heads/main/app/wps/wps.js,img-url=https://raw.githubusercontent.com/MaYIHEI/pin/refs/heads/main/app/wps.png
  *
  * ===== Quantumult X =====
  * [MITM]
@@ -35,7 +35,7 @@
  *   script:
  *     - name: WPS签到
  *       cron: '0 10 * * *'
- *       timeout: 120
+ *       timeout: 600
  * http:
  *   mitm:
  *     - "personal-act.wps.cn"
@@ -56,10 +56,11 @@ const $ = new Env("WPS");
 $.merge = typeof $argument === "object" && !!$argument && $argument.merge === true;
 if ($.merge) $.msg = (...a) => console.log(a.filter((x) => typeof x === "string" && x).join("\n"));
 
-const SCRIPT_VERSION = "2026-10-28.r3"; // 改一次 +1,确认拉到最新版
+const SCRIPT_VERSION = "2026-11-18.r6"; // 改一次 +1,确认拉到最新版
 $.log(`[INFO] 脚本版本 ${SCRIPT_VERSION}`);
 
-const CK_KEY = "wps_sid";
+const CK_KEY = "wps_sid";         // 兼容:单账号 / 面板手填 / 青龙环境变量
+const LIST_KEY = "wps_sids_list"; // 多账号:[{uid, wps_sid, ts}, ...],按 uid 去重
 
 // 任务开关:关闭才跳过(兼容字符串 "false"/"0" 与布尔 false,不同 BoxJS 存法都认);未设置=默认开启
 function taskOff(k) {
@@ -73,6 +74,9 @@ function debug(content) {
     $.log(`[DEBUG] ${typeof content === "string" ? content : JSON.stringify(content)}`);
 }
 
+// 多账号时每个账号写各自的体检 key;单账号仍用原 wps_status
+let STA = { key: "wps_status", name: "WPS" };
+
 // 记录本次结果,供「签到汇总」:ok 正常 / cookie 需重新抓取 / fail 其他失败 / none 未使用
 function saveStatus(s, msg) {
     msg = String(msg).slice(0, 100);
@@ -83,10 +87,23 @@ function saveStatus(s, msg) {
     if (s === "ok" && /^今日已/.test(msg)) {
         const day = (t) => new Date(t + 8 * 3600 * 1000).toISOString().slice(0, 10);
         let old = null;
-        try { old = JSON.parse($.getdata("wps_status") || "null"); } catch (e) {}
+        try { old = JSON.parse($.getdata(STA.key) || "null"); } catch (e) {}
         if (old && old.s === "ok" && !/^今日已/.test(old.msg) && day(old.t) === day(Date.now())) keep = old;
     }
-    checkinReport("wps_status", keep ? keepReward(keep, { s, msg }) : { s, msg }, { name: "WPS", author: "MaYIHEI", open: "https://apps.apple.com/app/id599852710" });
+    checkinReport(STA.key, keep ? keepReward(keep, { s, msg }) : { s, msg }, { name: STA.name, author: "MaYIHEI", open: "https://apps.apple.com/app/id599852710" });
+}
+
+// 读账号列表:以 uid 为唯一键;手填的 wps_sid 没有 uid 时仍可单跑
+function loadAccounts() {
+    const list = (safeJson($.getdata(LIST_KEY) || "[]") || []).filter((x) => x && x.wps_sid && x.uid);
+    const manual = String($.getdata(CK_KEY) || "").trim();
+    if (manual && !list.some((x) => x.wps_sid === manual)) list.push({ uid: "", wps_sid: manual });
+    return list;
+}
+
+function maskSid(s) {
+    s = String(s || "");
+    return s.length < 12 ? "已获取" : s.slice(0, 6) + "***" + s.slice(-4);
 }
 
 // ===== 接口 =====
@@ -133,6 +150,7 @@ $.results = []; // 各任务结果汇总,最后一条通知
 // 清除 cookie 开关(BoxJS 写 wps_clear=true)
 if (JSON.parse($.getdata("wps_clear") || "false")) {
     $.setdata("", CK_KEY);
+    $.setdata("", LIST_KEY);
     $.setdata("false", "wps_clear");
     $.msg("WPS", "", "✅ Cookie 已清除，请重新抓取");
     $.done();
@@ -145,13 +163,41 @@ if (JSON.parse($.getdata("wps_clear") || "false")) {
 }
 
 async function main() {
-    const sid = $.getdata(CK_KEY);
-    if (!sid) {
+    const accounts = loadAccounts();
+    if (!accounts.length) {
         saveStatus("none", "未抓取 Cookie");
         $.msg("WPS", "🚫 缺少 Cookie", "请先开启 cookie 抓取脚本,打开 WPS APP 进任意活动页停留 1 秒");
         return;
     }
 
+    // 逐个账号:写回 wps_sid 后复用原 runAccount(httpReq 等仍现读 wps_sid,任务逻辑不动)
+    const total = accounts.length;
+    const blocks = [];
+    for (let i = 0; i < total; i++) {
+        const acc = accounts[i];
+        STA = {
+            key: total > 1 ? `wps_status_${acc.uid || acc.wps_sid.slice(0, 8)}` : "wps_status",
+            name: total > 1 ? `WPS${i + 1}` : "WPS",
+        };
+        $.setdata(acc.wps_sid, CK_KEY);
+        $.results.length = 0;
+        $.log(`[INFO] ===== 账号 ${i + 1}/${total} (uid=${acc.uid || "?"}, ${maskSid(acc.wps_sid)}) =====`);
+        try {
+            await runAccount();
+        } catch (e) {
+            $.log(`[ERROR] 账号 ${i + 1} 异常: ${e}`);
+            $.results.push(`❌ 异常: ${e}`);
+            saveStatus("fail", String(e));
+        }
+        blocks.push([total > 1 ? `👤 账号 ${i + 1}${acc.uid ? `(uid=${acc.uid})` : ""}` : "", ...$.results.slice()].filter(Boolean).join("\n"));
+        if (i < total - 1) await sleep(jitter([8000, 20000]));
+    }
+
+    $.msg("WPS 任务汇总", "", blocks.join("\n\n"));
+}
+
+// 原单账号主流程(登录校验 + 任务串行),多账号时对每个账号各跑一遍
+async function runAccount() {
     // 动态取 user_id(签到加密需要,不写进脚本)+ 顺带校验登录态。
     // 关键:区分「网络超时(reject)」与「服务端明确返回非 ok(真失效)」——
     // 整点 cron 易撞网络抖动,网络错误重试一次自愈,绝不能误报成 cookie 失效让用户白重抓。
@@ -164,7 +210,7 @@ async function main() {
             if (j.result !== "ok" || !j.userid) {
                 // 服务端明确判失效 = 真·登录态失效,不重试
                 saveStatus("cookie", "wps_sid 已过期");
-                $.msg("WPS", "🚫 登录态失效", "wps_sid 已过期,请重新抓取(打开 WPS 进活动页)");
+                $.results.push("🚫 登录态失效: wps_sid 已过期,请重新抓取(打开 WPS 进活动页)");
                 $.log(`[ERROR] islogin 非 ok: ${r.body.slice(0, 200)}`);
                 return;
             }
@@ -179,7 +225,7 @@ async function main() {
     if (!uid) {
         // 重试后仍失败:是网络问题,不是 Cookie 失效——别误导用户去重抓
         saveStatus("fail", "网络异常,未能校验登录态");
-        $.msg("WPS", "⚠️ 网络异常", "islogin 请求超时(非 Cookie 失效),稍后会自动重试或手动运行一次");
+        $.results.push("⚠️ 网络异常: islogin 超时(非 Cookie 失效)");
         $.log(`[ERROR] islogin 重试后仍失败: ${lastErr}`);
         return;
     }
@@ -210,7 +256,6 @@ async function main() {
     }
     if (!ran) $.results.push("ℹ️ 所有任务均已关闭(插件设置或 BoxJS)");
 
-    $.msg("WPS 任务汇总", "", $.results.join("\n")); // $.msg 已把汇总打到日志,不再重复 $.log
     saveStatus("ok", $.results.map((r) => r.replace(/^\S+\s*/, "")).join(" · ")); // 汇总里显示各任务结果
 }
 
